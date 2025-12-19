@@ -1,0 +1,13 @@
+# Secrets
+*.env
+token.env
+
+# Runtime data
+*.json
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+
+
