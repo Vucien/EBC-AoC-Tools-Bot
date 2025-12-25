@@ -1,0 +1,52 @@
+# =====================
+# Secrets
+# =====================
+.env
+
+# Google Sheets Service Account
+EBC_Bot_service_account.json
+service_account.json
+*_service_account.json
+
+# =====================
+# Runtime Data (DO NOT COMMIT)
+# =====================
+character_registry.json
+artisan_data.json
+*.json
+
+# =====================
+# Python
+# =====================
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# =====================
+# Virtual Environment
+# =====================
+venv/
+env/
+ENV/
+.venv/
+
+# =====================
+# IDE
+# =====================
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# =====================
+# OS
+# =====================
+.DS_Store
+Thumbs.db
+
+# =====================
+# Logs
+# =====================
+*.log

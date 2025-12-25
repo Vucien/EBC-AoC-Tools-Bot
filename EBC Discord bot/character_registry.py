@@ -1,6 +1,7 @@
 """
 Character Registry Module for Discord Bot
 Updated with new registration flow: Class → Name & Power → Guild
+Includes Google Sheets integration for live editing
 """
 
 import json
@@ -8,6 +9,17 @@ import os
 from typing import Optional
 import discord
 from discord.ext import commands
+from datetime import datetime
+
+# Google Sheets Integration
+try:
+    import gspread
+    from google.oauth2.service_account import Credentials
+    SHEETS_AVAILABLE = True
+    print("✅ Google Sheets integration available")
+except ImportError:
+    SHEETS_AVAILABLE = False
+    print("⚠️ gspread not installed - Sheets sync disabled")
 
 # Import class emojis from main bot
 try:
@@ -50,6 +62,19 @@ HEALER_CLASSES = ["Cleric", "Bard", "Summoner"]
 CHARACTER_DATA_FILE = "character_registry.json"
 
 # =========================
+# GOOGLE SHEETS CONFIG
+# =========================
+
+# Google Sheets URL (the spreadsheet to sync with)
+GOOGLE_SHEET_URL = "https://docs.google.com/spreadsheets/d/18Z8VbH6xxspNSvWPDF9TU4eTRWOX_TcD4pM-zrm3P0w/edit?gid=0#gid=0"
+
+# Service account JSON file path
+SERVICE_ACCOUNT_FILE = "EBC_Bot_service_account.json"
+
+# Sheet name/tab to use (will be created if doesn't exist)
+SHEET_TAB_NAME = "Character Registry"
+
+# =========================
 # CHARACTER DATA STORAGE
 # =========================
 
@@ -78,6 +103,202 @@ def save_character_data():
             json.dump(character_registry, f, indent=2)
     except Exception as e:
         print(f"⚠️ Error saving character data: {e}")
+
+
+# =========================
+# GOOGLE SHEETS INTEGRATION
+# =========================
+
+def get_sheets_client():
+    """Initialize and return Google Sheets client"""
+    if not SHEETS_AVAILABLE:
+        raise RuntimeError("gspread not installed")
+    
+    if not os.path.exists(SERVICE_ACCOUNT_FILE):
+        raise FileNotFoundError(f"Service account file not found: {SERVICE_ACCOUNT_FILE}")
+    
+    # Define the scope
+    scope = [
+        'https://spreadsheets.google.com/feeds',
+        'https://www.googleapis.com/auth/drive'
+    ]
+    
+    # Authenticate using the service account
+    creds = Credentials.from_service_account_file(SERVICE_ACCOUNT_FILE, scopes=scope)
+    client = gspread.authorize(creds)
+    
+    return client
+
+
+def get_or_create_worksheet(client):
+    """Get the worksheet, creating it if it doesn't exist"""
+    # Extract spreadsheet ID from URL
+    sheet_id = GOOGLE_SHEET_URL.split('/d/')[1].split('/')[0]
+    
+    # Open the spreadsheet
+    spreadsheet = client.open_by_key(sheet_id)
+    
+    # Try to get the worksheet, create if doesn't exist
+    try:
+        worksheet = spreadsheet.worksheet(SHEET_TAB_NAME)
+    except gspread.WorksheetNotFound:
+        worksheet = spreadsheet.add_worksheet(title=SHEET_TAB_NAME, rows=1000, cols=10)
+        # Add headers
+        headers = [
+            "Discord ID",
+            "Discord Name", 
+            "Character Name",
+            "Class",
+            "Power Level",
+            "Healing Power",
+            "Guild",
+            "Last Updated"
+        ]
+        worksheet.update('A1:H1', [headers])
+        print(f"✅ Created new worksheet: {SHEET_TAB_NAME}")
+    
+    return worksheet
+
+
+async def export_to_sheets(bot):
+    """Export all character data to Google Sheets"""
+    if not SHEETS_AVAILABLE:
+        return False, "Google Sheets integration not available"
+    
+    try:
+        client = get_sheets_client()
+        worksheet = get_or_create_worksheet(client)
+        
+        # Prepare data rows
+        rows = []
+        for user_id, data in character_registry.items():
+            # Try to get Discord username
+            try:
+                user = await bot.fetch_user(int(user_id))
+                discord_name = user.display_name
+            except:
+                discord_name = f"Unknown#{user_id}"
+            
+            guilds = data.get("guilds", [])
+            guild_str = ", ".join(guilds) if guilds else ""
+            
+            row = [
+                str(user_id),
+                discord_name,
+                data.get("name", ""),
+                data.get("class", ""),
+                str(data.get("power_level", "")),
+                str(data.get("healing_power", "")) if data.get("healing_power") else "",
+                guild_str,
+                datetime.utcnow().strftime("%Y-%m-%d %H:%M:%S")
+            ]
+            rows.append(row)
+        
+        # Sort by guild, then by class
+        rows.sort(key=lambda x: (x[6], x[3]))
+        
+        # Clear only data rows (preserve header row with formatting)
+        if len(rows) > 0:
+            # Delete all rows except header
+            last_row = len(rows) + 1  # +1 for header row
+            if worksheet.row_count > 1:
+                # Clear range A2:H[last_row] (keeps row 1 untouched)
+                range_to_clear = f'A2:H{worksheet.row_count}'
+                worksheet.batch_clear([range_to_clear])
+            
+            # Update only data rows (starting at A2)
+            worksheet.update('A2', rows)
+        else:
+            # No data, just clear everything below headers
+            if worksheet.row_count > 1:
+                worksheet.batch_clear(['A2:H' + str(worksheet.row_count)])
+        
+        print(f"✅ Exported {len(rows)} characters to Google Sheets")
+        return True, f"Exported {len(rows)} characters successfully"
+        
+    except Exception as e:
+        print(f"❌ Error exporting to Sheets: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, f"Error: {str(e)}"
+
+
+async def import_from_sheets(bot):
+    """Import character data from Google Sheets (overwrites local data)"""
+    if not SHEETS_AVAILABLE:
+        return False, "Google Sheets integration not available"
+    
+    try:
+        client = get_sheets_client()
+        worksheet = get_or_create_worksheet(client)
+        
+        # Get all data
+        all_values = worksheet.get_all_values()
+        
+        if len(all_values) <= 1:
+            return False, "No data found in sheet (only headers)"
+        
+        # Skip header row
+        data_rows = all_values[1:]
+        
+        imported_count = 0
+        updated_count = 0
+        
+        for row in data_rows:
+            if len(row) < 7:  # Need at least Discord ID through Guild
+                continue
+            
+            discord_id_str = row[0].strip()
+            if not discord_id_str or not discord_id_str.isdigit():
+                continue
+            
+            discord_id = int(discord_id_str)
+            
+            guild_str = row[6].strip()
+            guilds_list = [g.strip() for g in guild_str.split(",") if g.strip()] if guild_str else []
+            
+            # Build character data
+            char_data = {
+                "name": row[2].strip(),
+                "class": row[3].strip(),
+                "guilds": guilds_list
+            }
+            
+            # Power level
+            try:
+                char_data["power_level"] = int(row[4].strip()) if row[4].strip() else 0
+            except ValueError:
+                char_data["power_level"] = 0
+            
+            # Healing power (optional)
+            if len(row) > 5 and row[5].strip():
+                try:
+                    char_data["healing_power"] = int(row[5].strip())
+                except ValueError:
+                    char_data["healing_power"] = None
+            else:
+                char_data["healing_power"] = None
+            
+            # Check if this is an update or new entry
+            if discord_id in character_registry:
+                updated_count += 1
+            else:
+                imported_count += 1
+            
+            character_registry[discord_id] = char_data
+        
+        # Save to JSON
+        save_character_data()
+        
+        message = f"Imported {imported_count} new, updated {updated_count} existing characters"
+        print(f"✅ {message}")
+        return True, message
+        
+    except Exception as e:
+        print(f"❌ Error importing from Sheets: {e}")
+        import traceback
+        traceback.print_exc()
+        return False, f"Error: {str(e)}"
 
 
 # =========================
@@ -427,15 +648,33 @@ def build_roster_table_embeds(guild: discord.Guild) -> list[discord.Embed]:
         
         total_guild_members = sum(len(members) for members in guild_groups[guild_name].values())
         
-        # Build the guild header with lines above and below
-        guild_header = (
+        # Add guild separator field (just shows total count)
+        guild_separator = (
             "─────────────────────────────────────\n"
             f"**{guild_name}** — {total_guild_members} members\n"
             "─────────────────────────────────────"
         )
         
-        guild_content_lines = []
+        # Check if we need a new embed before guild separator
+        if fields_count >= 25 or len(current_embed) + len(guild_separator) > 5500:
+            embeds.append(current_embed)
+            current_embed = discord.Embed(
+                title="<:ebccircle:1446026315907076126> Character Roster (continued)",
+                colour=discord.Colour.gold()
+            )
+            current_embed.timestamp = discord.utils.utcnow()
+            current_embed.set_footer(text="Last Updated")
+            fields_count = 0
         
+        # Add the guild separator field
+        current_embed.add_field(
+            name=guild_separator,
+            value="_ _",  # Zero-width space to satisfy Discord
+            inline=False
+        )
+        fields_count += 1
+        
+        # Now add one field per class within this guild
         for char_class in class_order:
             if char_class not in guild_groups[guild_name]:
                 continue
@@ -443,15 +682,13 @@ def build_roster_table_embeds(guild: discord.Guild) -> list[discord.Embed]:
             members = guild_groups[guild_name][char_class]
             class_emoji = CLASS_EMOJIS.get(char_class, "⚔️")
             
-            # Class header
-            guild_content_lines.append("")
-            guild_content_lines.append(f"{class_emoji} **{char_class}** — {len(members)} member{'s' if len(members) != 1 else ''}")
-            guild_content_lines.append("")
+            # Build class content
+            class_content_lines = []
             
             # Column headers in code block for alignment
-            guild_content_lines.append("```")
-            guild_content_lines.append(f"{'Character':<13} {'Power':<8} {'Heal':<7}")
-            guild_content_lines.append("─" * 28)
+            class_content_lines.append("```")
+            class_content_lines.append(f"{'Character':<13} {'Power':<8} {'Heal':<7}")
+            class_content_lines.append("─" * 28)
             
             # Add each member as a row
             for user_id, data in members:
@@ -474,34 +711,33 @@ def build_roster_table_embeds(guild: discord.Guild) -> list[discord.Embed]:
                 
                 # Build the row
                 row = f"{char_name_short:<13} {power_str:<8} {healing_str:<7}"
-                guild_content_lines.append(row)
+                class_content_lines.append(row)
             
-            guild_content_lines.append("```")
-            # Removed one empty line here for tighter spacing
-        
-        field_value = "\n".join(guild_content_lines)
-        
-        # Check if we need a new embed
-        if fields_count >= 25 or len(current_embed) + len(field_value) + len(guild_header) > 5500:
-            embeds.append(current_embed)
-            current_embed = discord.Embed(
-                title="<:ebccircle:1446026315907076126> Character Roster (continued)",
-                colour=discord.Colour.gold()
+            class_content_lines.append("```")
+            
+            field_value = "\n".join(class_content_lines)
+            
+            # Create field name with class info
+            field_name = f"{class_emoji} **{char_class}** — {len(members)} member{'s' if len(members) != 1 else ''}"
+            
+            # Check if we need a new embed before adding this class
+            if fields_count >= 25 or len(current_embed) + len(field_value) + len(field_name) > 5500:
+                embeds.append(current_embed)
+                current_embed = discord.Embed(
+                    title="<:ebccircle:1446026315907076126> Character Roster (continued)",
+                    colour=discord.Colour.gold()
+                )
+                current_embed.timestamp = discord.utils.utcnow()
+                current_embed.set_footer(text="Last Updated")
+                fields_count = 0
+            
+            # Add the class field (should never exceed 1024 chars now)
+            current_embed.add_field(
+                name=field_name,
+                value=field_value,
+                inline=False
             )
-            current_embed.timestamp = discord.utils.utcnow()
-            current_embed.set_footer(text="Last Updated")
-            fields_count = 0
-        
-        # Truncate if field value is too long (1024 char limit per field)
-        if len(field_value) > 1024:
-            field_value = field_value[:1020] + "..."
-        
-        current_embed.add_field(
-            name=guild_header,
-            value=field_value if field_value else "No members",
-            inline=False
-        )
-        fields_count += 1
+            fields_count += 1
     
     if fields_count > 0 or not embeds:
         embeds.append(current_embed)
@@ -575,6 +811,116 @@ async def cleanup_old_registry_messages(bot: commands.Bot, guild: discord.Guild)
         print(f"❌ Error during registry cleanup: {e}")
 
 
+
+
+# =========================
+# ROSTER PAGINATION VIEW
+# =========================
+
+class RosterPaginationView(discord.ui.View):
+    """
+    Pagination view for roster table with admin controls
+    Shows Previous/Next buttons with page counter
+    """
+    
+    def __init__(self, embeds: list[discord.Embed], timeout: float = None):
+        super().__init__(timeout=timeout)
+        self.embeds = embeds
+        self.current_page = 0
+        self.max_pages = len(embeds)
+        
+        # Update button states
+        self.update_buttons()
+    
+    def update_buttons(self):
+        """Enable/disable navigation buttons based on current page"""
+        self.previous_button.disabled = (self.current_page == 0)
+        self.next_button.disabled = (self.current_page >= self.max_pages - 1)
+        self.page_counter.label = f"Page {self.current_page + 1}/{self.max_pages}"
+    
+    def get_current_embed(self) -> discord.Embed:
+        """Get the embed for the current page with page indicator in footer"""
+        embed = self.embeds[self.current_page].copy()
+        
+        # Add page indicator to footer
+        if embed.footer and embed.footer.text:
+            original_footer = embed.footer.text
+            embed.set_footer(text=f"{original_footer} • Page {self.current_page + 1}/{self.max_pages}")
+        else:
+            embed.set_footer(text=f"Page {self.current_page + 1}/{self.max_pages}")
+        
+        return embed
+    
+    # Row 0: Pagination controls
+    @discord.ui.button(label="⬅️", style=discord.ButtonStyle.secondary, custom_id="roster_prev", row=0)
+    async def previous_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to previous page"""
+        if self.current_page > 0:
+            self.current_page -= 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
+        else:
+            await interaction.response.defer()
+    
+    @discord.ui.button(label="Page 1/1", style=discord.ButtonStyle.primary, custom_id="roster_page", disabled=True, row=0)
+    async def page_counter(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Page counter (non-interactive)"""
+        await interaction.response.defer()
+    
+    @discord.ui.button(label="➡️", style=discord.ButtonStyle.secondary, custom_id="roster_next", row=0)
+    async def next_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Go to next page"""
+        if self.current_page < self.max_pages - 1:
+            self.current_page += 1
+            self.update_buttons()
+            await interaction.response.edit_message(embed=self.get_current_embed(), view=self)
+        else:
+            await interaction.response.defer()
+    
+    # Row 1: Admin controls
+    @discord.ui.button(label="Edit Player", style=discord.ButtonStyle.secondary, emoji="✏️", custom_id="roster_edit", row=1)
+    async def edit_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Edit a player's character data (Admin only)"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ Only administrators can edit player data.",
+                ephemeral=True
+            )
+            return
+        
+        if not character_registry:
+            await interaction.response.send_message(
+                "📊 No characters registered yet.",
+                ephemeral=True
+            )
+            return
+        
+        # Directly open search modal
+        modal = SearchPlayerModal()
+        await interaction.response.send_modal(modal)
+    
+    @discord.ui.button(label="Remove Player", style=discord.ButtonStyle.danger, emoji="🗑️", custom_id="roster_remove", row=1)
+    async def remove_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        """Remove a player from the registry (Admin only)"""
+        if not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message(
+                "❌ Only administrators can remove player data.",
+                ephemeral=True
+            )
+            return
+        
+        if not character_registry:
+            await interaction.response.send_message(
+                "📊 No characters registered yet.",
+                ephemeral=True
+            )
+            return
+        
+        # Directly open search modal
+        modal = SearchPlayerToRemoveModal()
+        await interaction.response.send_modal(modal)
+
+
 async def update_roster_table(bot: commands.Bot, guild: discord.Guild):
     global roster_table_message_ids
     
@@ -589,16 +935,17 @@ async def update_roster_table(bot: commands.Bot, guild: discord.Guild):
     
     table_embeds = build_roster_table_embeds(guild)
     
-    # Add admin buttons to the first embed only
-    for i, embed in enumerate(table_embeds):
-        if i == 0:
-            # First embed gets the admin control buttons
-            view = RosterAdminView()
-            msg = await roster_channel.send(embed=embed, view=view)
-        else:
-            # Subsequent embeds have no buttons
-            msg = await roster_channel.send(embed=embed)
-        
+    # Post with pagination if multiple embeds, otherwise just admin buttons
+    if len(table_embeds) > 1:
+        # Multiple pages - use pagination view
+        view = RosterPaginationView(table_embeds)
+        msg = await roster_channel.send(embed=view.get_current_embed(), view=view)
+        roster_table_message_ids.append(msg.id)
+        print(f"📊 Posted paginated roster (message {msg.id}, {len(table_embeds)} pages)")
+    else:
+        # Single page - just use admin buttons (no pagination needed)
+        view = RosterAdminView()
+        msg = await roster_channel.send(embed=table_embeds[0], view=view)
         roster_table_message_ids.append(msg.id)
         print(f"📊 Posted roster table message {msg.id}")
 
@@ -628,13 +975,9 @@ class RosterAdminView(discord.ui.View):
             )
             return
         
-        # Show player selection dropdown
-        view = EditPlayerSelectView()
-        await interaction.response.send_message(
-            "**Select a player to edit:**",
-            view=view,
-            ephemeral=True
-        )
+        # Directly open search modal
+        modal = SearchPlayerModal()
+        await interaction.response.send_modal(modal)
     
     @discord.ui.button(label="Remove Player", style=discord.ButtonStyle.danger, emoji="🗑️")
     async def remove_player_button(self, interaction: discord.Interaction, button: discord.ui.Button):
@@ -653,27 +996,84 @@ class RosterAdminView(discord.ui.View):
             )
             return
         
-        # Show player selection dropdown
-        view = RemovePlayerSelectView()
-        await interaction.response.send_message(
-            "**Select a player to remove:**",
-            view=view,
-            ephemeral=True
-        )
+        # Directly open search modal
+        modal = SearchPlayerToRemoveModal()
+        await interaction.response.send_modal(modal)
 
 
-class EditPlayerSelectView(discord.ui.View):
-    def __init__(self, timeout: float = 300):
-        super().__init__(timeout=timeout)
-        self.add_item(EditPlayerSelect())
 
-
-class EditPlayerSelect(discord.ui.Select):
+class SearchPlayerModal(discord.ui.Modal, title="Search for Player"):
+    """Modal to search for a player by character name"""
+    
     def __init__(self):
-        # Build options from registered characters
+        super().__init__()
+        
+        self.search_query = discord.ui.TextInput(
+            label="Character Name",
+            placeholder="Type part of character name...",
+            required=True,
+            min_length=2,
+            max_length=50,
+        )
+        
+        self.add_item(self.search_query)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        query = self.search_query.value.strip().lower()
+        
+        # Search through all characters BY CHARACTER NAME ONLY (fast, no API calls)
+        matches = []
+        for user_id, data in character_registry.items():
+            char_name = data.get("name", "").lower()
+            
+            # Check if query matches character name
+            if query in char_name:
+                matches.append((user_id, data))
+        
+        if not matches:
+            await interaction.followup.send(
+                f"❌ No players found matching **'{self.search_query.value}'**\n"
+                f"Search by character name.",
+                ephemeral=True
+            )
+            return
+        
+        # Show results as dropdown (works for 1-25 matches)
+        if len(matches) <= 25:
+            view = SearchResultsView(matches)
+            match_text = "match" if len(matches) == 1 else "matches"
+            await interaction.followup.send(
+                f"🔍 Found **{len(matches)}** {match_text}. Select one to edit:",
+                view=view,
+                ephemeral=True
+            )
+        else:
+            # Too many matches - show list and ask to narrow search
+            match_list = "\n".join([f"• {data.get('name', 'Unknown')} ({data.get('class', 'Unknown')})" 
+                                   for _, data in matches[:10]])
+            await interaction.followup.send(
+                f"🔍 Found **{len(matches)}** matches (showing first 10):\n\n"
+                f"{match_list}\n\n"
+                f"Please narrow your search to see fewer results.",
+                ephemeral=True
+            )
+
+
+class SearchResultsView(discord.ui.View):
+    """View with dropdown showing search results"""
+    def __init__(self, matches: list, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.add_item(SearchResultsSelect(matches))
+
+
+class SearchResultsSelect(discord.ui.Select):
+    """Dropdown showing search results"""
+    def __init__(self, matches: list):
         options = []
         
-        for user_id, data in sorted(character_registry.items(), key=lambda x: x[1].get("name", ""))[:25]:
+        for user_id, data in matches:
             char_name = data.get("name", "Unknown")
             char_class = data.get("class", "Unknown")
             guild = data.get("guilds", ["No Guild"])[0]
@@ -681,16 +1081,8 @@ class EditPlayerSelect(discord.ui.Select):
             options.append(
                 discord.SelectOption(
                     label=f"{char_name} ({char_class})",
-                    description=f"{guild} - User ID: {user_id}",
+                    description=f"{guild}",
                     value=str(user_id)
-                )
-            )
-        
-        if not options:
-            options.append(
-                discord.SelectOption(
-                    label="No players found",
-                    value="none"
                 )
             )
         
@@ -700,27 +1092,15 @@ class EditPlayerSelect(discord.ui.Select):
             min_values=1,
             max_values=1
         )
+        
+        # Store matches for callback
+        self.matches = {str(user_id): data for user_id, data in matches}
     
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "none":
-            await interaction.response.edit_message(
-                content="❌ No players to edit.",
-                view=None
-            )
-            return
-        
         user_id = int(self.values[0])
+        data = self.matches[self.values[0]]
         
-        if user_id not in character_registry:
-            await interaction.response.edit_message(
-                content="❌ Player not found in registry.",
-                view=None
-            )
-            return
-        
-        data = character_registry[user_id]
-        
-        # Show edit modal with current data pre-filled
+        # Show edit modal
         if data.get("class") in HEALER_CLASSES:
             modal = EditCharacterModalWithHealing(user_id, data)
         else:
@@ -734,6 +1114,13 @@ class EditCharacterModal(discord.ui.Modal, title="Edit Character"):
         super().__init__()
         self.user_id = user_id
         self.current_data = current_data
+        
+        # Get current guilds as comma-separated string
+        current_guilds = current_data.get("guilds", [])
+        guilds_str = ", ".join(current_guilds) if current_guilds else ""
+        
+        # Create placeholder with available guilds
+        available_guilds_str = ", ".join(AVAILABLE_GUILDS)
         
         self.char_name = discord.ui.TextInput(
             label="Character Name",
@@ -749,8 +1136,17 @@ class EditCharacterModal(discord.ui.Modal, title="Edit Character"):
             max_length=10,
         )
         
+        self.guilds = discord.ui.TextInput(
+            label="Guild(s) - Comma separated",
+            placeholder=f"Valid: {available_guilds_str}",
+            default=guilds_str,
+            required=False,
+            max_length=100,
+        )
+        
         self.add_item(self.char_name)
         self.add_item(self.power_level)
+        self.add_item(self.guilds)
     
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -763,17 +1159,39 @@ class EditCharacterModal(discord.ui.Modal, title="Edit Character"):
             )
             return
         
+        # Parse guilds (comma-separated)
+        guilds_input = str(self.guilds.value).strip()
+        if guilds_input:
+            guilds_list = [g.strip() for g in guilds_input.split(",") if g.strip()]
+        else:
+            guilds_list = []
+        
+        # Validate guilds against AVAILABLE_GUILDS
+        if guilds_list:
+            invalid_guilds = [g for g in guilds_list if g not in AVAILABLE_GUILDS]
+            if invalid_guilds:
+                valid_options = ", ".join(AVAILABLE_GUILDS)
+                await interaction.followup.send(
+                    f"❌ Invalid guild(s): **{', '.join(invalid_guilds)}**\n\n"
+                    f"Valid guilds are:\n{valid_options}",
+                    ephemeral=True
+                )
+                return
+        
         # Update the character data
         character_registry[self.user_id]["name"] = str(self.char_name.value).strip()
         character_registry[self.user_id]["power_level"] = int(power_str)
+        character_registry[self.user_id]["guilds"] = guilds_list
         
         from datetime import datetime
         character_registry[self.user_id]["last_updated"] = datetime.utcnow().isoformat()
         
         save_character_data()
         
+        guild_display = ", ".join(guilds_list) if guilds_list else "No guild"
         await interaction.followup.send(
-            f"✅ Character **{self.char_name.value}** has been updated successfully!",
+            f"✅ Character **{self.char_name.value}** has been updated successfully!\n"
+            f"Guild(s): {guild_display}",
             ephemeral=True
         )
         
@@ -786,6 +1204,13 @@ class EditCharacterModalWithHealing(discord.ui.Modal, title="Edit Character"):
         super().__init__()
         self.user_id = user_id
         self.current_data = current_data
+        
+        # Get current guilds as comma-separated string
+        current_guilds = current_data.get("guilds", [])
+        guilds_str = ", ".join(current_guilds) if current_guilds else ""
+        
+        # Create placeholder with available guilds
+        available_guilds_str = ", ".join(AVAILABLE_GUILDS)
         
         self.char_name = discord.ui.TextInput(
             label="Character Name",
@@ -808,9 +1233,18 @@ class EditCharacterModalWithHealing(discord.ui.Modal, title="Edit Character"):
             max_length=10,
         )
         
+        self.guilds = discord.ui.TextInput(
+            label="Guild(s) - Comma separated",
+            placeholder=f"Valid: {available_guilds_str}",
+            default=guilds_str,
+            required=False,
+            max_length=100,
+        )
+        
         self.add_item(self.char_name)
         self.add_item(self.power_level)
         self.add_item(self.healing_power)
+        self.add_item(self.guilds)
     
     async def on_submit(self, interaction: discord.Interaction):
         await interaction.response.defer(ephemeral=True)
@@ -832,18 +1266,40 @@ class EditCharacterModalWithHealing(discord.ui.Modal, title="Edit Character"):
             )
             return
         
+        # Parse guilds (comma-separated)
+        guilds_input = str(self.guilds.value).strip()
+        if guilds_input:
+            guilds_list = [g.strip() for g in guilds_input.split(",") if g.strip()]
+        else:
+            guilds_list = []
+        
+        # Validate guilds against AVAILABLE_GUILDS
+        if guilds_list:
+            invalid_guilds = [g for g in guilds_list if g not in AVAILABLE_GUILDS]
+            if invalid_guilds:
+                valid_options = ", ".join(AVAILABLE_GUILDS)
+                await interaction.followup.send(
+                    f"❌ Invalid guild(s): **{', '.join(invalid_guilds)}**\n\n"
+                    f"Valid guilds are:\n{valid_options}",
+                    ephemeral=True
+                )
+                return
+        
         # Update the character data
         character_registry[self.user_id]["name"] = str(self.char_name.value).strip()
         character_registry[self.user_id]["power_level"] = int(power_str)
         character_registry[self.user_id]["healing_power"] = int(healing_str)
+        character_registry[self.user_id]["guilds"] = guilds_list
         
         from datetime import datetime
         character_registry[self.user_id]["last_updated"] = datetime.utcnow().isoformat()
         
         save_character_data()
         
+        guild_display = ", ".join(guilds_list) if guilds_list else "No guild"
         await interaction.followup.send(
-            f"✅ Character **{self.char_name.value}** has been updated successfully!",
+            f"✅ Character **{self.char_name.value}** has been updated successfully!\n"
+            f"Guild(s): {guild_display}",
             ephemeral=True
         )
         
@@ -851,18 +1307,102 @@ class EditCharacterModalWithHealing(discord.ui.Modal, title="Edit Character"):
         await update_registry_embed(interaction.client, interaction.guild)
 
 
-class RemovePlayerSelectView(discord.ui.View):
-    def __init__(self, timeout: float = 300):
-        super().__init__(timeout=timeout)
-        self.add_item(RemovePlayerSelect())
 
 
-class RemovePlayerSelect(discord.ui.Select):
+class SearchPlayerToRemoveModal(discord.ui.Modal, title="Search for Player to Remove"):
+    """Modal to search for a player to remove"""
+    
     def __init__(self):
-        # Build options from registered characters
+        super().__init__()
+        
+        self.search_query = discord.ui.TextInput(
+            label="Character Name",
+            placeholder="Type part of character name...",
+            required=True,
+            min_length=2,
+            max_length=50,
+        )
+        
+        self.add_item(self.search_query)
+    
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        
+        query = self.search_query.value.strip().lower()
+        
+        # Search through all characters BY CHARACTER NAME ONLY (fast, no API calls)
+        matches = []
+        for user_id, data in character_registry.items():
+            char_name = data.get("name", "").lower()
+            
+            # Check if query matches character name
+            if query in char_name:
+                matches.append((user_id, data))
+        
+        if not matches:
+            await interaction.followup.send(
+                f"❌ No players found matching **'{self.search_query.value}'**\n"
+                f"Search by character name.",
+                ephemeral=True
+            )
+            return
+        
+        # If only one match, go directly to confirmation
+        if len(matches) == 1:
+            user_id, data = matches[0]
+            char_name = data.get("name", "Unknown")
+            
+            embed = discord.Embed(
+                title="⚠️ Remove Player?",
+                description=(
+                    f"Are you sure you want to remove **{char_name}** from the registry?\n\n"
+                    f"User ID: {user_id}\n\n"
+                    f"This action cannot be undone."
+                ),
+                colour=discord.Colour.orange()
+            )
+            
+            view = ConfirmRemovePlayerView(user_id, char_name)
+            await interaction.followup.send(
+                embed=embed,
+                view=view,
+                ephemeral=True
+            )
+            return
+        
+        # Multiple matches - show dropdown (max 25)
+        if len(matches) <= 25:
+            view = RemoveSearchResultsView(matches[:25])
+            await interaction.followup.send(
+                f"🔍 Found **{len(matches)}** match(es). Select one to remove:",
+                view=view,
+                ephemeral=True
+            )
+        else:
+            # Too many matches - show list and ask to narrow search
+            match_list = "\n".join([f"• {data.get('name', 'Unknown')} ({data.get('class', 'Unknown')})" 
+                                   for _, data in matches[:10]])
+            await interaction.followup.send(
+                f"🔍 Found **{len(matches)}** matches (showing first 10):\n\n"
+                f"{match_list}\n\n"
+                f"Please narrow your search to see fewer results.",
+                ephemeral=True
+            )
+
+
+class RemoveSearchResultsView(discord.ui.View):
+    """View with dropdown showing search results for removal"""
+    def __init__(self, matches: list, timeout: float = 300):
+        super().__init__(timeout=timeout)
+        self.add_item(RemoveSearchResultsSelect(matches))
+
+
+class RemoveSearchResultsSelect(discord.ui.Select):
+    """Dropdown showing search results for removal"""
+    def __init__(self, matches: list):
         options = []
         
-        for user_id, data in sorted(character_registry.items(), key=lambda x: x[1].get("name", ""))[:25]:
+        for user_id, data in matches:
             char_name = data.get("name", "Unknown")
             char_class = data.get("class", "Unknown")
             guild = data.get("guilds", ["No Guild"])[0]
@@ -870,16 +1410,8 @@ class RemovePlayerSelect(discord.ui.Select):
             options.append(
                 discord.SelectOption(
                     label=f"{char_name} ({char_class})",
-                    description=f"{guild} - User ID: {user_id}",
+                    description=f"{guild}",
                     value=str(user_id)
-                )
-            )
-        
-        if not options:
-            options.append(
-                discord.SelectOption(
-                    label="No players found",
-                    value="none"
                 )
             )
         
@@ -889,25 +1421,13 @@ class RemovePlayerSelect(discord.ui.Select):
             min_values=1,
             max_values=1
         )
+        
+        # Store matches for callback
+        self.matches = {str(user_id): data for user_id, data in matches}
     
     async def callback(self, interaction: discord.Interaction):
-        if self.values[0] == "none":
-            await interaction.response.edit_message(
-                content="❌ No players to remove.",
-                view=None
-            )
-            return
-        
         user_id = int(self.values[0])
-        
-        if user_id not in character_registry:
-            await interaction.response.edit_message(
-                content="❌ Player not found in registry.",
-                view=None
-            )
-            return
-        
-        char_name = character_registry[user_id].get("name", "Unknown")
+        char_name = self.matches[self.values[0]].get("name", "Unknown")
         
         # Show confirmation dialog
         embed = discord.Embed(
@@ -1620,7 +2140,102 @@ def setup_character_registry(bot: commands.Bot):
     
     bot.loop.create_task(on_ready_registry_cleanup())
 
+    # =========================
+    # GOOGLE SHEETS COMMANDS
+    # =========================
+    
+    @bot.tree.command(name="synctosheet", description="📤 Export character registry to Google Sheets (Manager only)")
+    async def sync_to_sheet(interaction: discord.Interaction):
+        """Export all character data to Google Sheets"""
+        
+        # Check if user has manager role (using artisan manager role as proxy)
+        manager_role_ids = [1448277106223222804]  # Artisan Manager role
+        user_roles = [role.id for role in interaction.user.roles]
+        
+        if not any(role_id in user_roles for role_id in manager_role_ids) and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ You need manager permissions to use this command.", ephemeral=True)
+            return
+        
+        if not SHEETS_AVAILABLE:
+            await interaction.response.send_message(
+                "❌ Google Sheets integration is not available.\n"
+                "Make sure `gspread` is installed and `EBC_Bot_service_account.json` exists.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        success, message = await export_to_sheets(bot)
+        
+        if success:
+            await interaction.followup.send(
+                f"✅ **Export Successful**\n\n{message}\n\n"
+                f"View the sheet: [Click Here]({GOOGLE_SHEET_URL})",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **Export Failed**\n\n{message}",
+                ephemeral=True
+            )
+    
+    
+    @bot.tree.command(name="importfromsheet", description="📥 Import character data from Google Sheets (Manager only)")
+    async def import_from_sheet(interaction: discord.Interaction):
+        """Import character data from Google Sheets - OVERWRITES local data"""
+        
+        # Check if user has manager role
+        manager_role_ids = [1448277106223222804]  # Artisan Manager role
+        user_roles = [role.id for role in interaction.user.roles]
+        
+        if not any(role_id in user_roles for role_id in manager_role_ids) and not interaction.user.guild_permissions.administrator:
+            await interaction.response.send_message("❌ You need manager permissions to use this command.", ephemeral=True)
+            return
+        
+        if not SHEETS_AVAILABLE:
+            await interaction.response.send_message(
+                "❌ Google Sheets integration is not available.\n"
+                "Make sure `gspread` is installed and `EBC_Bot_service_account.json` exists.",
+                ephemeral=True
+            )
+            return
+        
+        await interaction.response.defer(ephemeral=True)
+        
+        success, message = await import_from_sheets(bot)
+        
+        if success:
+            # Update the registry embed and roster table
+            for guild in bot.guilds:
+                registry_channel = guild.get_channel(CHARACTER_REGISTRY_CHANNEL_ID)
+                if isinstance(registry_channel, discord.TextChannel):
+                    try:
+                        await update_registry_embed(bot, guild)
+                    except:
+                        pass
+                
+                roster_channel = guild.get_channel(ROSTER_TABLE_CHANNEL_ID)
+                if isinstance(roster_channel, discord.TextChannel):
+                    try:
+                        await update_roster_table(bot, guild)
+                    except:
+                        pass
+            
+            await interaction.followup.send(
+                f"✅ **Import Successful**\n\n{message}\n\n"
+                f"Registry and roster table have been updated.",
+                ephemeral=True
+            )
+        else:
+            await interaction.followup.send(
+                f"❌ **Import Failed**\n\n{message}",
+                ephemeral=True
+            )
+
     
     print("✅ Character Registry module loaded")
     print(f"📋 Slash commands added: /setupregistry, /registrystats, /exportregistry, /setuprostertable, /whoiswho, /deleteregistry")
+    if SHEETS_AVAILABLE:
+        print(f"📊 Google Sheets commands added: /synctosheet, /importfromsheet")
 
